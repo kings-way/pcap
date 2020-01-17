@@ -557,6 +557,32 @@ impl Capture<Inactive> {
         self
     }
 
+    /// Set immediate mode on or off for a not-yet-activated capture handle.
+    /// Separate implementations are required for Windows, Mac, and Linux.
+    /// Windows and Mac do not support pcap_set_immediate.
+    //
+    // Linux must be set on an Inactive Capture. Mac requires an Active Capture.
+    // Currently unsure if Windows cares (It definitely works with an Active Capture).
+    //
+    // Question 1:
+    //   Context: It's my understanding that determining the installed version of libpcap
+    //            is problematic. Thus, checking for feature support is difficult.
+    //   * Should we change this guard to Not Win + Not Mac and rely on Issues to find
+    //     find out where this fails?
+    //   * Or, should we whitelist OS's as they're needed? (I'm leaning toward the former)
+    //
+    // Question 2:
+    //   * pcap_set_immediate_mode returns PCAP_ERROR_ACTIVATED if called on an
+    //     activated capture handle. Since this is defined on Capture<Inactive>,
+    //     we can safely ignore this right?
+    #[cfg(target_os = "linux")]
+    pub fn immediate_mode(self, to: bool) -> Capture<Inactive> {
+        unsafe {
+            raw::pcap_set_immediate_mode(*self.handle, if to {1} else {0});
+            self
+        }
+    }
+
     /// Set the time stamp precision returned in captures.
     #[cfg(not(windows))]
     pub fn precision(self, precision: Precision) -> Capture<Inactive> {
@@ -744,6 +770,61 @@ impl Capture<Active> {
             self.nonblock = true;
             Ok(self)
         })
+    }
+
+    /// Set immediate mode on or off for a not-yet-activated capture handle.
+    /// Separate implementations are required for Windows, Mac, and Linux.
+    /// Windows and Mac do not support pcap_set_immediate.
+    // Idea: Since Linux is set on Inactive Capture, should we
+    //       have the OS X method set a flag that is checked for when the
+    //       capture is activated which actually enables immediate mode
+    //       in order to keep the API consistent.
+    // Question 1: Do BSD's use BIOCIMMEDIATE or pcap_set_immediate_mode?
+    //             This guard should be updated if the former.
+    // Question 2: ioctl returns a -1 when it fails in this case.
+    //             Should immediate_mode() return an error when this happens?
+    #[cfg(target_os = "macos")]
+    pub fn immediate_mode(self, to: bool) -> Capture<Active> {
+        unsafe {
+            let i: libc::c_uint = if to {1} else {0};
+            // See /usr/include/sys/ioccom.h for the steps
+            // required to derive BIOCIMMEDIATE.
+            const BIOCIMMEDIATE: libc::c_ulong = 0x80044270;
+            libc::ioctl(raw::pcap_fileno(*self.handle), BIOCIMMEDIATE, &i);
+            self
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn immediate_mode(self, to: bool) -> Capture<Active> {
+        unsafe {
+            // From WinPcap docs: "pcap_setmintocopy() changes the minimum
+            // amount of data in the kernel buffer that causes a read from the
+            // application to return (unless the timeout expires)."
+            // Therefore, setting a value of 0 on false does not disable
+            // immediate mode like it does with pcap_set_immediate_mode() or
+            // BIOCIMMEDIATE.
+            // Instead, we have two choices when false:
+            //    1. Skip the call to pcap_setmincopy() entirely - allowing
+            //       WinPcap to maintain the default (currently 16000 bytes)
+            //       while making false a noop.
+            //       [This is the current implementation]
+            //    2. Set the default ourselves on false to an appropriate value
+            //       - likely 16000 bytes to remain consistent with WinPcap.
+            //       This has the advantage of toggling immediate_mode working
+            //       as expected (is immediate_mode ever toggled in practice
+            //       though?) The disadvantages include potential confusion if
+            //       the default value is ever changed in WinPcap or if
+            //       immediate_mode(false) is called after mintocopy(int),
+            //       overwriting the previous call.
+            //       The disadvantages may be manageable with proper documentation
+            //       and the advantage is important iff there's a use case
+            //       where toggling_immediate mode on and off makes sense.
+            if to {
+                raw::pcap_setmintocopy(*self.handle, 1);
+            }
+            self
+        }
     }
 }
 
